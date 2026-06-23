@@ -1,0 +1,12 @@
+{
+    "run": {
+        "count": 10
+    },
+    "proxy": "",
+    "browser_proxy": "http://127.0.0.1:40080",
+    "api": {
+        "endpoint": "",
+        "token": "",
+        "append": true
+    }
+}

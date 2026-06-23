@@ -27,6 +27,8 @@
 ## 安装
 
 ```bash
+cd grok-register
+python3 -m venv venv
 pip install -r requirements.txt
 ```
 
@@ -100,6 +102,7 @@ python DrissionPage_example.py --count 0
 
 
 # linux上无头启动（需要使用这种方式才能够运行）
+xvfb-run --server-args="-screen 0 1024x768x24" venv/bin/python DrissionPage_example.py --count 3000
 xvfb-run --server-args="-screen 0 1024x768x24" .venv/bin/python DrissionPage_example.py --count 3000
 ```
 
