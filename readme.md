@@ -1,16 +1,18 @@
 # Grok 账号批量注册工具
 
-基于 [DrissionPage](https://github.com/g1879/DrissionPage) 的 Grok (x.ai) 账号自动注册脚本，使用 [DuckMail](https://duckmail.sbs) 临时邮箱接收验证码，通过 Chrome 扩展修复 CDP `MouseEvent.screenX/screenY` 缺陷绕过 Cloudflare Turnstile。
+基于 [DrissionPage](https://github.com/g1879/DrissionPage) 的 Grok (x.ai) 账号自动注册脚本，使用 [Smailpro](https://smailpro.com) 临时邮箱接收验证码，通过 Chrome 扩展修复 CDP `MouseEvent.screenX/screenY` 缺陷绕过 Cloudflare Turnstile。
 
 注册完成后自动推送 SSO token 到 [grok2api](https://github.com/chenyme/grok2api) 号池。
 
 ## 特性
 
-- DuckMail 临时邮箱（`curl_cffi` TLS 指纹伪装）
+- Smailpro 临时邮箱（`curl_cffi` TLS 指纹伪装）
 - Cloudflare Turnstile 自动绕过（Chrome 扩展 patch `MouseEvent.screenX/screenY`）
+- 域名拒绝检测（邮箱域名被 x.ai 拒绝时自动记录并跳过）
 - 无头服务器支持（Xvfb 虚拟显示器，自动检测 Linux 环境）
 - 中英文界面自动适配
 - 自动推送 SSO token 到 grok2api（支持 append 合并模式）
+- 邮箱尝试日志（`logs/email_attempts.log`，JSON Lines 格式）
 
 ---
 
@@ -18,8 +20,7 @@
 
 - Python 3.10+
 - Chromium 或 Chrome 浏览器
-- [DuckMail](https://duckmail.sbs) 账号（用于创建临时邮箱）
-- 可选：[grok2api](https://github.com/chenyme/grok2api) 实例（用于自动导入 SSO token）
+- [grok2api](https://github.com/chenyme/grok2api) Docker 实例（用于提供代理清理 CF 流量 + 自动导入 SSO token）
 
 ---
 
@@ -40,6 +41,17 @@ pip install playwright && python -m playwright install chromium && python -m pla
 
 ---
 
+## 部署 grok2api（Docker）
+
+本脚本需要配合 Docker 中运行的 [grok2api](https://github.com/chenyme/grok2api) 使用。grok2api 提供：
+
+1. **代理服务** — 通过 CF 清理流量，浏览器通过该代理访问 x.ai，避免直连被风控
+2. **SSO token 管理接口** — 注册完成后自动推送 token 到号池
+
+请参考 [grok2api 文档](https://github.com/chenyme/grok2api) 部署 Docker 实例，部署完成后记录其管理接口地址和 `app_key`。
+
+---
+
 ## 配置文件（config.json）
 
 ```bash
@@ -51,8 +63,6 @@ cp config.example.json config.json
 ```json
 {
     "run": { "count": 10 },
-    "duckmail_api_base": "https://api.duckmail.sbs",
-    "duckmail_bearer": "<your_duckmail_bearer_token>",
     "proxy": "",
     "browser_proxy": "",
     "api": {
@@ -68,23 +78,11 @@ cp config.example.json config.json
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `run.count` | int | 注册轮数，`0` 为无限循环，可通过 `--count` 覆盖 |
-| `duckmail_api_base` | string | DuckMail API 地址，默认 `https://api.duckmail.sbs` |
-| `duckmail_bearer` | string | DuckMail Bearer Token（[获取方式](#获取-duckmail-bearer-token)） |
-| `proxy` | string | DuckMail API 请求代理（可选） |
-| `browser_proxy` | string | 浏览器代理，无头服务器需翻墙时填写（可选） |
+| `proxy` | string | Smailpro API 请求代理（可选） |
+| `browser_proxy` | string | 浏览器代理，指向 grok2api Docker 提供的代理地址，用于通过 CF 清理流量访问 x.ai |
 | `api.endpoint` | string | grok2api 管理接口地址，留空跳过推送 |
 | `api.token` | string | grok2api 的 `app_key` |
 | `api.append` | bool | `true` 合并线上已有 token，`false` 覆盖 |
-
----
-
-## 获取 DuckMail Bearer Token
-
-1. 打开 [duckmail.sbs](https://duckmail.sbs) 并注册登录
-2. 打开浏览器开发者工具 (F12) → Network
-3. 刷新页面，找到任意发往 `api.duckmail.sbs` 的请求
-4. 复制请求头中 `Authorization: Bearer <token>` 里的 token
-5. 填入 `config.json` 的 `duckmail_bearer` 字段
 
 ---
 
@@ -112,6 +110,7 @@ sso/
   sso_<timestamp>.txt     ← 每行一个 SSO token
 logs/
   run_<timestamp>.log     ← 每轮注册的邮箱、密码和结果
+  email_attempts.log      ← 每次邮箱尝试的详细记录（JSON Lines）
 ```
 
 目录在首次运行时自动创建。
@@ -122,7 +121,7 @@ logs/
 
 ```
 ├── DrissionPage_example.py     # 主脚本
-├── email_register.py           # DuckMail 临时邮箱封装
+├── email_register.py           # Smailpro 临时邮箱封装
 ├── config.json                 # 配置文件（不入库）
 ├── config.example.json         # 配置模板
 ├── requirements.txt            # Python 依赖
@@ -138,7 +137,7 @@ logs/
 ## 无头服务器部署注意
 
 - snap 版 chromium 在 root 下有 AppArmor 限制，推荐用 playwright 安装的 chromium
-- 服务器直连 x.ai 可能被墙，需在 `browser_proxy` 填写代理地址
+- 服务器需通过 grok2api Docker 代理访问 x.ai，在 `browser_proxy` 填写代理地址
 - 脚本自动检测 Linux 环境并启用 Xvfb + playwright chromium 路径
 
 ---
@@ -147,4 +146,4 @@ logs/
 
 - [kevinr229/grok-maintainer](https://github.com/kevinr229/grok-maintainer) — 原始项目
 - [grok2api](https://github.com/chenyme/grok2api) — Grok API 代理
-- [DuckMail](https://duckmail.sbs) — 临时邮箱服务
+- [Smailpro](https://smailpro.com) — 临时邮箱服务

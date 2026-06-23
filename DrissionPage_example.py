@@ -9,10 +9,22 @@ import time
 import os
 import secrets
 import sys
+import json
+import urllib3
+import requests
 
 from email_register import get_email_and_token, get_oai_code
 
+# ---------- 自定义异常 ----------
+class DomainRejectedError(Exception):
+    """邮箱域名被网页明确拒绝"""
+    pass
 
+class NoVerificationCodeError(Exception):
+    """未获取到验证码（超时或邮件未到达）"""
+    pass
+
+# ---------- 日志初始化 ----------
 def setup_run_logger() -> logging.Logger:
     log_dir = os.path.join(os.path.dirname(__file__), "logs")
     os.makedirs(log_dir, exist_ok=True)
@@ -34,13 +46,51 @@ def setup_run_logger() -> logging.Logger:
     logger.info("日志文件: %s", log_path)
     return logger
 
-
 run_logger: logging.Logger = None
 
+# ---------- 独立邮箱尝试日志 ----------
+def setup_email_attempt_logger() -> logging.Logger:
+    log_dir = os.path.join(os.path.dirname(__file__), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "email_attempts.log")
+    
+    logger = logging.getLogger("email_attempts")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    
+    fmt = logging.Formatter("%(message)s")   # 只写消息内容，时间戳在记录内
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    return logger
 
+email_attempt_logger = None
 
+def log_email_attempt(email, dev_token, status, error=None, profile=None, sso=None, code=None):
+    """将一次尝试的结果写入独立日志文件（JSON Lines）"""
+    global email_attempt_logger
+    if email_attempt_logger is None:
+        email_attempt_logger = setup_email_attempt_logger()
+    
+    record = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "email": email,
+        "dev_token": dev_token,
+        "status": status,
+    }
+    if error:
+        record["error"] = str(error)
+    if profile:
+        record.update(profile)   # given_name, family_name, password
+    if sso:
+        record["sso"] = sso
+    if code:
+        record["verification_code"] = code
+    
+    email_attempt_logger.info(json.dumps(record, ensure_ascii=False))
+
+# ---------- 运行时环境适配 ----------
 def ensure_stable_python_runtime():
-    # 优先自动切到更稳定的 3.12 / 3.13，避免 3.14 下 Mail.tm 偶发 TLS/兼容问题。
     if sys.version_info < (3, 14) or os.environ.get("DPE_REEXEC_DONE") == "1":
         return
 
@@ -62,12 +112,9 @@ def ensure_stable_python_runtime():
         env["DPE_REEXEC_DONE"] = "1"
         os.execve(candidate, [candidate, os.path.abspath(__file__), *sys.argv[1:]], env)
 
-
 def warn_runtime_compatibility():
-    # 中文提示：避免把底层 TLS 兼容问题误判成脚本逻辑错误。
     if sys.version_info >= (3, 14):
         print("[提示] 当前 Python 为 3.14+；若出现 Mail.tm TLS 异常，建议改用 Python 3.12 或 3.13。")
-
 
 ensure_stable_python_runtime()
 warn_runtime_compatibility()
@@ -107,10 +154,8 @@ if _browser_proxy:
 
 # Linux 服务器自动检测 chromium 路径
 import platform
-import shutil
 import glob as _glob_mod
 if platform.system() == "Linux":
-    # 优先用 playwright 装的 chromium（无 AppArmor 限制）
     _pw_chromes = _glob_mod.glob(os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome"))
     if _pw_chromes:
         co.set_browser_path(_pw_chromes[0])
@@ -119,11 +164,10 @@ if platform.system() == "Linux":
             if os.path.isfile(_candidate):
                 co.set_browser_path(_candidate)
                 break
-    # user_data_path 在 start_browser() 每轮动态设置，此处不固定
 
 co.set_timeouts(base=1)
 
-# 加载修复 MouseEvent.screenX / screenY 的扩展。
+# 加载修复 MouseEvent.screenX / screenY 的扩展
 EXTENSION_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "turnstilePatch"))
 co.add_extension(EXTENSION_PATH)
 
@@ -137,9 +181,8 @@ _sso_dir = os.path.join(os.path.dirname(__file__), "sso")
 _sso_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 DEFAULT_SSO_FILE = os.path.join(_sso_dir, f"sso_{_sso_ts}.txt")
 
-
+# ---------- 浏览器控制函数 ----------
 def start_browser():
-    # 每轮从全新浏览器开始，使用独立临时 profile 目录避免 Cookie/Session 复用。
     global browser, page, _chrome_temp_dir
     _chrome_temp_dir = tempfile.mkdtemp(prefix="chrome_run_")
     co.set_user_data_path(_chrome_temp_dir)
@@ -148,9 +191,7 @@ def start_browser():
     page = tabs[-1] if tabs else browser.new_tab()
     return browser, page
 
-
 def stop_browser():
-    # 完整关闭整个浏览器实例，并清理本轮临时 profile，供下一轮重新拉起。
     global browser, page, _chrome_temp_dir
     if browser is not None:
         try:
@@ -163,9 +204,7 @@ def stop_browser():
         shutil.rmtree(_chrome_temp_dir, ignore_errors=True)
     _chrome_temp_dir = ""
 
-
 def restart_browser():
-    # 清除 cookie/storage 代替完整重启，节省 Chrome 冷启动时间。
     global browser, page
     if browser is None:
         start_browser()
@@ -179,9 +218,7 @@ def restart_browser():
         stop_browser()
         start_browser()
 
-
 def refresh_active_page():
-    # 验证码确认后页面会跳转，旧 page 句柄可能断开，这里统一重新获取当前活动标签页。
     global browser, page
     if browser is None:
         start_browser()
@@ -195,9 +232,7 @@ def refresh_active_page():
         restart_browser()
     return page
 
-
 def open_signup_page():
-    # 每轮开始时打开注册页，并切到“使用邮箱注册”流程。
     global page
     refresh_active_page()
     try:
@@ -207,14 +242,10 @@ def open_signup_page():
         page = browser.new_tab(SIGNUP_URL)
     click_email_signup_button()
 
-
 def close_current_page():
-    # 兼容旧调用名，实际行为改为整轮重启浏览器。
     restart_browser()
 
-
 def has_profile_form():
-    # 最终注册页只要出现姓名和密码输入框，就认为已经成功进入资料填写阶段。
     refresh_active_page()
     try:
         return bool(page.run_js(
@@ -228,44 +259,147 @@ return !!(givenInput && familyInput && passwordInput);
     except Exception:
         return False
 
-
+# ---------- 注册步骤函数（已修改） ----------
 def click_email_signup_button(timeout=10):
-    # 页面打开后，自动点击“使用邮箱注册”按钮。
     deadline = time.time() + timeout
     while time.time() < deadline:
         clicked = page.run_js(r"""
-const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-const target = candidates.find((node) => {
-    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
-    return text.includes('使用邮箱注册') || text.includes('signupwithemail') || text.includes('signupemail') || text.includes('continuewith email') || text.includes('email');
-});
-
-if (!target) {
-    return false;
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
 }
 
-target.click();
-return true;
+function normalize(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function looksLikeEmailSignup(node) {
+    if (!node || node.disabled || node.getAttribute?.('aria-disabled') === 'true') {
+        return false;
+    }
+
+    const text = normalize(node.innerText || node.textContent || '');
+    const compactText = text.replace(/\s+/g, '');
+    const aria = normalize(node.getAttribute('aria-label') || '');
+    const href = normalize(node.getAttribute('href') || '');
+    const testid = normalize(node.getAttribute('data-testid') || '');
+    const cls = normalize(node.className || '');
+
+    return compactText.includes('使用邮箱注册')
+        || compactText.includes('邮箱注册')
+        || compactText.includes('sign up with email')
+        || compactText.includes('continue with email')
+        || compactText.includes('signupwithemail')
+        || compactText.includes('signupemail')
+        || text === 'email'
+        || text.includes('email')
+        || aria.includes('email')
+        || aria.includes('邮箱')
+        || href.includes('email')
+        || testid.includes('email')
+        || cls.includes('email');
+}
+
+function clickNode(node) {
+    if (!node) {
+        return false;
+    }
+    if (typeof node.scrollIntoView === 'function') {
+        node.scrollIntoView({ block: 'center', inline: 'center' });
+    }
+    node.focus?.();
+    node.click?.();
+    return true;
+}
+
+const pageText = normalize(document.body ? document.body.innerText : '');
+if (pageText.includes('blocked due to abusive traffic patterns')) {
+    return 'traffic-blocked';
+}
+
+const visibleCandidates = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
+    .filter(isVisible);
+const target = visibleCandidates.find(looksLikeEmailSignup) || null;
+if (target) {
+    return clickNode(target) ? 'clicked' : 'not-found';
+}
+
+const bodyText = normalize(document.body ? document.body.innerText : '');
+if (bodyText.includes('使用邮箱注册') || bodyText.includes('邮箱注册') || bodyText.includes('sign up with email') || bodyText.includes('continue with email')) {
+    const all = Array.from(document.querySelectorAll('*')).filter((node) => isVisible(node) && looksLikeEmailSignup(node));
+    const fallback = all.find((node) => ['A', 'BUTTON', 'INPUT'].includes(node.tagName)) || all[0] || null;
+    if (fallback) {
+        return clickNode(fallback) ? 'clicked' : 'not-found';
+    }
+}
+
+return 'not-found';
         """)
 
-        if clicked:
+        if clicked == 'clicked':
             return True
+
+        if clicked == 'traffic-blocked':
+            raise Exception('x.ai 返回 Blocked due to abusive traffic patterns，当前网络/环境被风控拦截')
+
+        if clicked == 'not-found':
+            snapshot = page.run_js(r"""
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+function collectText(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+return {
+    url: location.href,
+    title: document.title,
+    bodyText: collectText(document.body ? document.body.innerText : '').slice(0, 1500),
+    buttons: Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
+        .filter(isVisible)
+        .slice(0, 30)
+        .map((node) => ({
+            tag: node.tagName,
+            text: collectText(node.innerText || node.textContent || ''),
+            ariaLabel: node.getAttribute('aria-label') || '',
+            href: node.getAttribute('href') || '',
+            dataTestId: node.getAttribute('data-testid') || '',
+            type: node.getAttribute('type') || '',
+            className: String(node.className || ''),
+        })),
+};
+            """)
+            print(f"[Debug] 邮箱注册页摘要: {snapshot}")
 
         time.sleep(0.5)
 
     raise Exception('未找到“使用邮箱注册”按钮')
 
-
-def fill_email_and_submit(timeout=15):
-    # 复用 `email_register.py` 里的邮箱获取逻辑，保留邮箱与 token 供后续验证码步骤继续使用。
-    email, dev_token = get_email_and_token()
-    if not email or not dev_token:
-        raise Exception("获取邮箱失败")
-
+def fill_email_and_submit(email, dev_token, timeout=15):
+    """
+    使用给定的邮箱和 token 填写邮箱输入框并点击注册按钮。
+    若检测到域名拒绝提示，抛出 DomainRejectedError。
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         filled = page.run_js(
-            """
+            r"""
 const email = arguments[0];
 
 function isVisible(node) {
@@ -280,9 +414,85 @@ function isVisible(node) {
     return rect.width > 0 && rect.height > 0;
 }
 
-const input = Array.from(document.querySelectorAll('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]')).find((node) => {
-    return isVisible(node) && !node.disabled && !node.readOnly;
-}) || null;
+function getInputText(node) {
+    const parts = [
+        node.id,
+        node.name,
+        node.type,
+        node.autocomplete,
+        node.placeholder,
+        node.getAttribute('aria-label'),
+        node.getAttribute('data-testid'),
+        node.getAttribute('data-test'),
+        node.getAttribute('data-cy'),
+    ];
+
+    if (node.id) {
+        const label = document.querySelector(`label[for="${CSS.escape(node.id)}"]`);
+        if (label) {
+            parts.push(label.innerText || label.textContent || '');
+        }
+    }
+
+    const wrappingLabel = node.closest('label');
+    if (wrappingLabel) {
+        parts.push(wrappingLabel.innerText || wrappingLabel.textContent || '');
+    }
+
+    const container = node.closest('div, form, section');
+    if (container) {
+        parts.push(container.innerText || container.textContent || '');
+    }
+
+    return parts.filter(Boolean).join(' ').replace(/\s+/g, ' ').toLowerCase();
+}
+
+function looksLikeEmailInput(node) {
+    if (!isVisible(node) || node.disabled || node.readOnly) {
+        return false;
+    }
+
+    const type = String(node.type || '').toLowerCase();
+    if (type && !['email', 'text', 'search', ''].includes(type)) {
+        return false;
+    }
+
+    const text = getInputText(node);
+    return type === 'email'
+        || /\b(e-?mail|email address|mail)\b/.test(text)
+        || text.includes('邮箱')
+        || text.includes('电子邮件')
+        || text.includes('邮件地址');
+}
+
+function findEmailInput() {
+    const preferredSelector = [
+        'input[data-testid="email"]',
+        'input[name="email"]',
+        'input[type="email"]',
+        'input[autocomplete="email"]',
+        'input[id*="email" i]',
+        'input[name*="email" i]',
+        'input[placeholder*="email" i]',
+        'input[aria-label*="email" i]',
+        'input[placeholder*="邮箱" i]',
+        'input[aria-label*="邮箱" i]',
+    ].join(',');
+
+    const preferred = Array.from(document.querySelectorAll(preferredSelector)).find(looksLikeEmailInput);
+    if (preferred) {
+        return preferred;
+    }
+
+    const form = Array.from(document.querySelectorAll('form')).find((node) => {
+        const text = (node.innerText || node.textContent || '').toLowerCase();
+        return text.includes('email') || text.includes('邮箱') || text.includes('邮件');
+    });
+    const scope = form || document;
+    return Array.from(scope.querySelectorAll('input')).find(looksLikeEmailInput) || null;
+}
+
+const input = findEmailInput();
 
 if (!input) {
     return 'not-ready';
@@ -291,7 +501,6 @@ if (!input) {
 input.focus();
 input.click();
 
-// 不能只写 `input.value = xxx`，否则 React / 受控表单可能没有同步内部状态。
 const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
 const tracker = input._valueTracker;
 if (tracker) {
@@ -350,9 +559,85 @@ function isVisible(node) {
     return rect.width > 0 && rect.height > 0;
 }
 
-const input = Array.from(document.querySelectorAll('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]')).find((node) => {
-    return isVisible(node) && !node.disabled && !node.readOnly;
-}) || null;
+function getInputText(node) {
+    const parts = [
+        node.id,
+        node.name,
+        node.type,
+        node.autocomplete,
+        node.placeholder,
+        node.getAttribute('aria-label'),
+        node.getAttribute('data-testid'),
+        node.getAttribute('data-test'),
+        node.getAttribute('data-cy'),
+    ];
+
+    if (node.id) {
+        const label = document.querySelector(`label[for="${CSS.escape(node.id)}"]`);
+        if (label) {
+            parts.push(label.innerText || label.textContent || '');
+        }
+    }
+
+    const wrappingLabel = node.closest('label');
+    if (wrappingLabel) {
+        parts.push(wrappingLabel.innerText || wrappingLabel.textContent || '');
+    }
+
+    const container = node.closest('div, form, section');
+    if (container) {
+        parts.push(container.innerText || container.textContent || '');
+    }
+
+    return parts.filter(Boolean).join(' ').replace(/\s+/g, ' ').toLowerCase();
+}
+
+function looksLikeEmailInput(node) {
+    if (!isVisible(node) || node.disabled || node.readOnly) {
+        return false;
+    }
+
+    const type = String(node.type || '').toLowerCase();
+    if (type && !['email', 'text', 'search', ''].includes(type)) {
+        return false;
+    }
+
+    const text = getInputText(node);
+    return type === 'email'
+        || /\b(e-?mail|email address|mail)\b/.test(text)
+        || text.includes('邮箱')
+        || text.includes('电子邮件')
+        || text.includes('邮件地址');
+}
+
+function findEmailInput() {
+    const preferredSelector = [
+        'input[data-testid="email"]',
+        'input[name="email"]',
+        'input[type="email"]',
+        'input[autocomplete="email"]',
+        'input[id*="email" i]',
+        'input[name*="email" i]',
+        'input[placeholder*="email" i]',
+        'input[aria-label*="email" i]',
+        'input[placeholder*="邮箱" i]',
+        'input[aria-label*="邮箱" i]',
+    ].join(',');
+
+    const preferred = Array.from(document.querySelectorAll(preferredSelector)).find(looksLikeEmailInput);
+    if (preferred) {
+        return preferred;
+    }
+
+    const form = Array.from(document.querySelectorAll('form')).find((node) => {
+        const text = (node.innerText || node.textContent || '').toLowerCase();
+        return text.includes('email') || text.includes('邮箱') || text.includes('邮件');
+    });
+    const scope = form || document;
+    return Array.from(scope.querySelectorAll('input')).find(looksLikeEmailInput) || null;
+}
+
+const input = findEmailInput();
 
 if (!input || !input.checkValidity() || !(input.value || '').trim()) {
     return false;
@@ -363,7 +648,7 @@ const buttons = Array.from(document.querySelectorAll('button[type="submit"], but
 });
 const submitButton = buttons.find((node) => {
     const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
-    const t = text.toLowerCase(); return text === '注册' || text.includes('注册') || t === 'signup' || t === 'sign up' || t.includes('sign up');
+    const t = text.toLowerCase(); return text === '注册' || text.includes('注册') || text === '继续' || text.includes('继续') || text === '下一步' || text.includes('下一步') || t === 'signup' || t === 'sign up' || t.includes('sign up') || t.includes('continue') || t.includes('next');
 });
 
 if (!submitButton || submitButton.disabled) {
@@ -377,19 +662,72 @@ return true;
 
             if clicked:
                 print(f"[*] 已填写邮箱并点击注册: {email}")
-                return email, dev_token
+                
+                # 检测域名拒绝提示
+                time.sleep(1.5)
+                error_msg = page.run_js("""
+                    const errNodes = document.querySelectorAll('p[class*="danger"], span[class*="danger"], div[class*="danger"]');
+                    for (let node of errNodes) {
+                        const text = (node.innerText || node.textContent || '').toLowerCase();
+                        if (text.includes('拒绝') || text.includes('使用其他') || text.includes('rejected') || text.includes('support@x.ai')) {
+                            return text.trim();
+                        }
+                    }
+                    return null;
+                """)
+                
+                if error_msg:
+                    raise DomainRejectedError(f"DOMAIN_REJECTED: {error_msg}")
+
+                return True   # 成功
 
         time.sleep(0.5)
 
+    debug_snapshot = page.run_js(
+        r"""
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+const inputs = Array.from(document.querySelectorAll('input')).filter(isVisible).map((node) => ({
+    type: node.type || '',
+    name: node.name || '',
+    id: node.id || '',
+    testid: node.getAttribute('data-testid') || '',
+    autocomplete: node.autocomplete || '',
+    placeholder: node.placeholder || '',
+    ariaLabel: node.getAttribute('aria-label') || '',
+    valueLength: String(node.value || '').length,
+}));
+
+const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]')).filter(isVisible).map((node) => ({
+    text: String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim(),
+    disabled: !!node.disabled,
+    ariaDisabled: node.getAttribute('aria-disabled') || '',
+}));
+
+return { url: location.href, inputs, buttons };
+        """
+    )
+    print(f"[Debug] 邮箱页 DOM 摘要: {debug_snapshot}")
     raise Exception("未找到邮箱输入框或注册按钮")
 
-
-
 def fill_code_and_submit(email, dev_token, timeout=60):
-    # 复用 `email_register.py` 里的验证码轮询逻辑，等待邮件到达后自动填写 OTP。
+    """
+    获取验证码并填写提交。
+    若未获取到验证码，抛出 NoVerificationCodeError。
+    """
     code = get_oai_code(dev_token, email)
     if not code:
-        raise Exception("获取验证码失败")
+        raise NoVerificationCodeError("获取验证码失败（超时或邮件未到达）")
 
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -504,7 +842,6 @@ return merged === code ? 'filled' : 'box-mismatch';
                 code,
             )
         except PageDisconnectedError:
-            # 点击确认邮箱后如果刚好发生跳转，旧页面句柄会断开；此时切到新页继续判断即可。
             refresh_active_page()
             if has_profile_form():
                 print("[*] 验证码提交后已跳转到最终注册页。")
@@ -654,9 +991,7 @@ return { url: location.href, inputs, buttons };
     print(f"[Debug] 验证码页 DOM 摘要: {debug_snapshot}")
     raise Exception("未找到验证码输入框或确认邮箱按钮")
 
-
 def getTurnstileToken():
-    # 复用现有 turnstile 处理逻辑，在最终注册页需要时再触发。
     page.run_js("try { turnstile.reset() } catch(e) { }")
 
     turnstileResponse = None
@@ -677,7 +1012,6 @@ function getRandomInt(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// 旧方案在 4K 屏下不稳定，这里给出更自然的屏幕坐标。
 let screenX = getRandomInt(800, 1200);
 let screenY = getRandomInt(400, 600);
 
@@ -693,17 +1027,13 @@ Object.defineProperty(MouseEvent.prototype, 'screenY', { value: screenY });
         time.sleep(1)
     raise Exception("failed to solve turnstile")
 
-
 def build_profile():
-    # 生成一组可重复使用的注册资料，密码至少包含大小写、数字和特殊字符。
     given_name = "Neo"
     family_name = "Lin"
     password = "N" + secrets.token_hex(4) + "!a7#" + secrets.token_urlsafe(6)
     return given_name, family_name, password
 
-
 def fill_profile_and_submit(timeout=30):
-    # 在验证码通过后，直接锁定“可见且可写”的真实输入框，避免命中隐藏节点或 React 受控副本。
     given_name, family_name, password = build_profile()
     deadline = time.time() + timeout
     turnstile_token = ""
@@ -942,9 +1272,7 @@ return challengeInput ? String(challengeInput.value || '').trim() : 'not-found';
 
     raise Exception("未找到最终注册表单或完成注册按钮")
 
-
 def extract_visible_numbers(timeout=60):
-    # 登录/注册完成后，提取页面上可见的普通数字文本，不处理任何敏感 Cookie。
     deadline = time.time() + timeout
     while time.time() < deadline:
         result = page.run_js(
@@ -1008,9 +1336,7 @@ return matches.slice(0, 30);
 
     raise Exception("登录后未提取到可见数字文本")
 
-
 def wait_for_sso_cookie(timeout=30):
-    # 必须在注册完成后再取 sso，优先抓取精确的 sso cookie。
     deadline = time.time() + timeout
     last_seen_names = set()
 
@@ -1046,9 +1372,7 @@ def wait_for_sso_cookie(timeout=30):
 
     raise Exception(f"注册完成后未获取到 sso cookie，当前已见 cookie: {sorted(last_seen_names)}")
 
-
 def append_sso_to_txt(sso_value, output_path=DEFAULT_SSO_FILE):
-    # 按用户要求，一行写一个 sso 值，持续追加。
     normalized = str(sso_value or "").strip()
     if not normalized:
         raise Exception("待写入的 sso 为空")
@@ -1059,14 +1383,7 @@ def append_sso_to_txt(sso_value, output_path=DEFAULT_SSO_FILE):
 
     print(f"[*] 已追加写入 sso 到文件: {output_path}")
 
-
 def push_sso_to_api(new_tokens: list):
-    # 推送 SSO token 到 grok2api 管理接口。
-    # append=false：直接将本次 token 列表全量推送（覆盖）。
-    # append=true（默认）：先 GET 查询线上现有 token，合并本次后全量推送。
-    import json
-    import urllib3
-    import requests
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     config_path = os.path.join(os.path.dirname(__file__), "config.json")
@@ -1097,9 +1414,6 @@ def push_sso_to_api(new_tokens: list):
             get_resp = requests.get(endpoint, headers=headers, timeout=15, verify=False)
             if get_resp.status_code == 200:
                 data = get_resp.json()
-                # 兼容两种响应格式：
-                # 新版: {"tokens": {"ssoBasic": [...]}}
-                # 旧版: {"ssoBasic": [...]}
                 if isinstance(data, dict) and isinstance(data.get("tokens"), dict):
                     existing = data["tokens"].get("ssoBasic", [])
                 else:
@@ -1138,43 +1452,93 @@ def push_sso_to_api(new_tokens: list):
     except Exception as e:
         print(f"[Warn] 推送 API 失败: {e}")
 
-
+# ---------- 单轮注册（含日志记录） ----------
 def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False):
-    # 单轮流程：打开注册页 -> 完成注册 -> 获取 sso -> 写 txt。
-    open_signup_page()
-    email, dev_token = fill_email_and_submit()
-    fill_code_and_submit(email, dev_token)
-    profile = fill_profile_and_submit()
-    sso_value = wait_for_sso_cookie()
-    append_sso_to_txt(sso_value, output_path)
+    """
+    单轮注册流程，统一获取邮箱和 token，并在最后记录尝试结果。
+    """
+    #设定本轮注册的最大硬限时：180 秒（3 分钟）
+    MAX_ROUND_DURATION = 80 
+    round_start_time = time.time()
 
-    if extract_numbers:
-        extract_visible_numbers()
+    def check_global_timeout(step_name):
+        """辅助闭包：检查是否超过本轮总限时"""
+        if time.time() - round_start_time > MAX_ROUND_DURATION:
+            raise TimeoutError(f"【硬超时】{step_name} 阶段由于本轮总耗时超过 {MAX_ROUND_DURATION} 秒，强行终止")
 
-    result = {
-        "email": email,
-        "sso": sso_value,
-        **profile,
-    }
+    # 1. 获取临时邮箱和 token
+    email, dev_token = get_email_and_token()
+    if not email or not dev_token:
+        log_email_attempt("", "", "failed", error="获取临时邮箱失败")
+        raise Exception("获取邮箱失败")
 
-    if run_logger:
-        run_logger.info(
-            "注册成功 | email=%s | password=%s | given=%s | family=%s",
-            email,
-            profile.get("password", ""),
-            profile.get("given_name", ""),
-            profile.get("family_name", ""),
+    # 2. 执行注册流程
+    try:
+        open_signup_page()
+        check_global_timeout("打开注册页")  #检查超时
+
+        fill_email_and_submit(email, dev_token)   # 可能抛出 DomainRejectedError
+        check_global_timeout("填写邮箱提交")  #检查超时
+
+        # 注意：这里我们同时把等待验证码的默认超时传参缩短，双重保险
+        code = fill_code_and_submit(email, dev_token, timeout=30)   # 可能抛出 NoVerificationCodeError
+        check_global_timeout("填写验证码提交")  #检查超时
+
+        profile = fill_profile_and_submit()
+        check_global_timeout("填写资料提交")  #检查超时
+
+        sso_value = wait_for_sso_cookie()
+        append_sso_to_txt(sso_value, output_path)
+
+        if extract_numbers:
+            extract_visible_numbers()
+
+        # 成功 -> 记录
+        log_email_attempt(
+            email=email,
+            dev_token=dev_token,
+            status="success",
+            profile=profile,
+            sso=sso_value,
+            code=code
         )
 
-    print(f"[*] 本轮注册完成，邮箱: {email}")
-    return result
+        result = {
+            "email": email,
+            "sso": sso_value,
+            **profile,
+        }
+        if run_logger:
+            run_logger.info(
+                "注册成功 | email=%s | password=%s | given=%s | family=%s",
+                email,
+                profile.get("password", ""),
+                profile.get("given_name", ""),
+                profile.get("family_name", ""),
+            )
+        print(f"[*] 本轮注册完成，邮箱: {email}")
+        return result
 
+    except DomainRejectedError as e:
+        log_email_attempt(email=email, dev_token=dev_token, status="rejected", error=str(e))
+        raise
+
+    except NoVerificationCodeError as e:
+        log_email_attempt(email=email, dev_token=dev_token, status="no_code", error=str(e))
+        raise
+
+    except TimeoutError as e:
+        #捕获我们自己定义的硬超时，记录日志
+        log_email_attempt(email=email, dev_token=dev_token, status="failed", error=str(e))
+        raise
+
+    except Exception as e:
+        log_email_attempt(email=email, dev_token=dev_token, status="failed", error=str(e))
+        raise
 
 def load_run_count() -> int:
-    # 从 config.json 读取默认执行轮数，配置不存在时返回 10。
     config_path = os.path.join(os.path.dirname(__file__), "config.json")
     try:
-        import json
         with open(config_path, "r", encoding="utf-8") as f:
             conf = json.load(f)
         v = conf.get("run", {}).get("count")
@@ -1184,9 +1548,7 @@ def load_run_count() -> int:
         pass
     return 10
 
-
 def main():
-    # 默认循环执行；每轮完成后关闭当前页，再自动进入下一轮。
     global run_logger
     run_logger = setup_run_logger()
 
@@ -1231,7 +1593,6 @@ def main():
             push_sso_to_api(collected_sso)
 
         stop_browser()
-
 
 if __name__ == "__main__":
     main()

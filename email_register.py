@@ -1,12 +1,10 @@
-
 from __future__ import annotations
 
 import json
 import logging
-import random
 import re
-import string
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -20,247 +18,193 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ============================================================
-# DuckMail 配置（从 config.json 加载）
+# 基础配置
 # ============================================================
-
 _config_path = Path(__file__).parent / "config.json"
 _conf: Dict[str, Any] = {}
 if _config_path.exists():
     with _config_path.open("r", encoding="utf-8") as _f:
         _conf = json.load(_f)
 
-DUCKMAIL_API_BASE = str(_conf.get("duckmail_api_base", "https://api.duckmail.sbs"))
-DUCKMAIL_BEARER = str(_conf.get("duckmail_bearer", ""))
 PROXY = str(_conf.get("proxy", ""))
-
-# ============================================================
-# 适配层：为 DrissionPage_example.py 提供简单接口
-# ============================================================
-
 _temp_email_cache: Dict[str, str] = {}
 
+_global_session = None
+_global_use_cffi = False
 
-def get_email_and_token() -> Tuple[Optional[str], Optional[str]]:
-    """
-    创建 DuckMail 临时邮箱并返回 (email, mail_token)。
-    供 DrissionPage_example.py 调用。
-    """
-    email, _password, mail_token = create_temp_email()
-    if email and mail_token:
-        _temp_email_cache[email] = mail_token
-        return email, mail_token
-    return None, None
+def _get_session():
+    global _global_session, _global_use_cffi
+    if _global_session is not None:
+        return _global_session, _global_use_cffi
 
-
-def get_oai_code(dev_token: str, email: str, timeout: int = 30) -> Optional[str]:
-    """
-    轮询 DuckMail 获取 OTP 验证码。
-    供 DrissionPage_example.py 调用。
-
-    Returns:
-        验证码字符串（去除连字符，如 "MM0SF3"）或 None
-    """
-    code = wait_for_verification_code(mail_token=dev_token, timeout=timeout)
-    if code:
-        code = code.replace("-", "")
-    return code
-
-
-# ============================================================
-# DuckMail 核心函数
-# ============================================================
-
-def _create_duckmail_session():
-    """创建 DuckMail 请求会话（优先 curl_cffi 绕 TLS 指纹）"""
     if curl_requests:
-        session = curl_requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
+        _global_session = curl_requests.Session()
+        _global_session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://smailpro.com",
+            "Referer": "https://smailpro.com/",
         })
         if PROXY:
-            session.proxies = {"http": PROXY, "https": PROXY}
-        return session, True
+            _global_session.proxies = {"http": PROXY, "https": PROXY}
+        _global_use_cffi = True
+    else:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        _global_session = requests.Session()
+        retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retry)
+        _global_session.mount("https://", adapter)
+        _global_session.mount("http://", adapter)
+        _global_session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json, text/plain, */*",
+        })
+        if PROXY:
+            _global_session.proxies = {"http": PROXY, "https": PROXY}
+        _global_use_cffi = False
 
-    # fallback to requests
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    s = requests.Session()
-    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    })
-    if PROXY:
-        s.proxies = {"http": PROXY, "https": PROXY}
-    return s, False
+    return _global_session, _global_use_cffi
 
 
 def _do_request(session, use_cffi, method, url, **kwargs):
-    """统一请求，curl_cffi 加 impersonate 参数"""
     if use_cffi:
         kwargs.setdefault("impersonate", "chrome131")
     return getattr(session, method)(url, **kwargs)
 
 
-def _generate_password(length=14):
-    lower = string.ascii_lowercase
-    upper = string.ascii_uppercase
-    digits = string.digits
-    special = "!@#$%"
-    pwd = [random.choice(lower), random.choice(upper),
-           random.choice(digits), random.choice(special)]
-    all_chars = lower + upper + digits + special
-    pwd += [random.choice(all_chars) for _ in range(length - 4)]
-    random.shuffle(pwd)
-    return "".join(pwd)
+# ============================================================
+# Smailpro 核心流：获取 Payload 与创建
+# ============================================================
+
+def get_smailpro_payload(target_url: str) -> str:
+    """去 smailpro 换取签名的 JWT Payload"""
+    session, use_cffi = _get_session()
+    encoded_url = urllib.parse.quote(target_url, safe="")
+    payload_api = f"https://smailpro.com/app/payload?url={encoded_url}"
+    
+    res = _do_request(session, use_cffi, "get", payload_api, timeout=15)
+    if res.status_code == 200:
+        val = res.text.strip()
+        if val:
+            return val
+    raise Exception(f"无法获取 Smailpro 签名 Payload: HTTP {res.status_code} - {res.text[:100]}")
 
 
 def create_temp_email() -> Tuple[str, str, str]:
-    """创建 DuckMail 临时邮箱，返回 (email, password, mail_token)"""
-    if not DUCKMAIL_BEARER:
-        raise Exception("duckmail_bearer 未设置，无法创建临时邮箱")
-
-    chars = string.ascii_lowercase + string.digits
-    length = random.randint(8, 13)
-    email_local = "".join(random.choice(chars) for _ in range(length))
-    email = f"{email_local}@duckmail.sbs"
-    password = _generate_password()
-
-    api_base = DUCKMAIL_API_BASE.rstrip("/")
-    bearer_headers = {"Authorization": f"Bearer {DUCKMAIL_BEARER}"}
-    session, use_cffi = _create_duckmail_session()
-
+    """
+    创建邮箱，并将关键的原始有效 payload 传出，作为后续轮询的身份令牌
+    """
+    create_url = "https://api.sonjj.com/v1/temp_email/create"
     try:
-        # 1. 创建账号
-        res = _do_request(session, use_cffi, "post",
-                          f"{api_base}/accounts",
-                          json={"address": email, "password": password},
-                          headers=bearer_headers, timeout=15)
-        if res.status_code not in (200, 201):
-            raise Exception(f"创建邮箱失败: {res.status_code} - {res.text[:200]}")
-
-        # 2. 获取 mail token
-        time.sleep(0.5)
-        token_res = _do_request(session, use_cffi, "post",
-                                f"{api_base}/token",
-                                json={"address": email, "password": password},
-                                timeout=15)
-        if token_res.status_code == 200:
-            mail_token = token_res.json().get("token")
-            if mail_token:
-                print(f"[*] DuckMail 临时邮箱创建成功: {email}")
-                return email, password, mail_token
-
-        raise Exception(f"获取邮件 Token 失败: {token_res.status_code}")
-    except Exception as e:
-        raise Exception(f"DuckMail 创建邮箱失败: {e}")
-
-
-def fetch_emails(mail_token: str) -> List[Dict[str, Any]]:
-    """获取 DuckMail 邮件列表"""
-    try:
-        api_base = DUCKMAIL_API_BASE.rstrip("/")
-        headers = {"Authorization": f"Bearer {mail_token}"}
-        session, use_cffi = _create_duckmail_session()
-        res = _do_request(session, use_cffi, "get",
-                          f"{api_base}/messages",
-                          headers=headers, timeout=15)
+        # 1. 这一轮仅获取一次基础 Payload
+        payload = get_smailpro_payload(create_url)
+        
+        # 2. 带着这个 Payload 去请求真实创建
+        api_url = f"{create_url}?payload={payload}"
+        session, use_cffi = _get_session()
+        res = _do_request(session, use_cffi, "get", api_url, timeout=15)
+        
         if res.status_code == 200:
             data = res.json()
-            return data.get("hydra:member") or data.get("member") or data.get("data") or []
-    except Exception:
-        pass
-    return []
+            email = data.get("email")
+            if email:
+                print(f"[*] Smailpro 临时邮箱创建成功: {email}")
+                # ?? 关键修改：把第一步换到的 payload 直接当成 mail_token 返回给主脚本
+                return email, "smailpro_no_pass", payload
+                
+        raise Exception(f"创建请求未返回有效邮箱: HTTP {res.status_code} - {res.text[:100]}")
+    except Exception as e:
+        raise Exception(f"Smailpro 创建邮箱失败: {e}")
 
 
-def fetch_email_detail(mail_token: str, msg_id: str) -> Optional[Dict]:
-    """获取 DuckMail 单封邮件详情"""
+# ============================================================
+# 适配层：对外导出标准接口
+# ============================================================
+
+def get_email_and_token() -> Tuple[Optional[str], Optional[str]]:
+    """供 DrissionPage_example.py 调用"""
     try:
-        api_base = DUCKMAIL_API_BASE.rstrip("/")
-        headers = {"Authorization": f"Bearer {mail_token}"}
-        session, use_cffi = _create_duckmail_session()
-
-        if isinstance(msg_id, str) and msg_id.startswith("/messages/"):
-            msg_id = msg_id.split("/")[-1]
-
-        res = _do_request(session, use_cffi, "get",
-                          f"{api_base}/messages/{msg_id}",
-                          headers=headers, timeout=15)
-        if res.status_code == 200:
-            return res.json()
-    except Exception:
-        pass
-    return None
+        email, _password, mail_token = create_temp_email()
+        if email and mail_token:
+            _temp_email_cache[email] = mail_token
+            return email, mail_token
+    except Exception as e:
+        print(f"[-] 获取邮箱遇到阻碍: {e}")
+    return None, None
 
 
-def wait_for_verification_code(mail_token: str, timeout: int = 120) -> Optional[str]:
-    """轮询 DuckMail 等待验证码邮件"""
+def get_oai_code(dev_token: str, email: str, timeout: int = 15) -> Optional[str]:
+    """
+    高效轮询收件箱
+    dev_token: 主脚本传回来的，也就是创建邮箱时锁定的那个合法 payload
+    """
     start = time.time()
     seen_ids = set()
-
+    
+    print(f"[*] 开始轮询 Smailpro 收件箱 ({email}) ...")
+    session, use_cffi = _get_session()
+    
+    # ?? 完美闭环：轮询期间只请求 api.sonjj.com，完全不碰 smailpro.com 官网
+    inbox_api = f"https://api.sonjj.com/v1/temp_email/inbox?payload={dev_token}"
+    
     while time.time() - start < timeout:
-        messages = fetch_emails(mail_token)
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            msg_id = msg.get("id") or msg.get("@id")
-            if not msg_id or msg_id in seen_ids:
-                continue
-            seen_ids.add(msg_id)
-
-            detail = fetch_email_detail(mail_token, str(msg_id))
-            if detail:
-                content = detail.get("text") or detail.get("html") or ""
-                code = extract_verification_code(content)
-                if code:
-                    print(f"[*] 从 DuckMail 提取到验证码: {code}")
-                    return code
+        try:
+            res = _do_request(session, use_cffi, "get", inbox_api, timeout=15)
+            
+            if res.status_code == 200:
+                data = res.json()
+                print(f"data is {data}")
+                messages = data.get("messages", [])
+                
+                for msg in messages:
+                    # 识别唯一邮件，防止重复处理（增加 Smailpro 专用的 mid 字段）
+                    msg_id = msg.get("mid") or msg.get("id") or msg.get("uid") or str(msg.get("textDate", ""))
+                    if not msg_id or msg_id in seen_ids:
+                        continue
+                    seen_ids.add(msg_id)
+                    
+                    # 提取验证码
+                    content = json.dumps(msg, ensure_ascii=False)
+                    code = extract_verification_code(content)
+                    if code:
+                        print(f"[*] ?? 成功从 Smailpro 提取到验证码: {code}")
+                        return code.replace("-", "")
+            else:
+                # 暴露出真实的非 200 错误代码，便于定位网络或节点问题
+                print(f"[Warn] 轮询期间接口返回异常状态码: HTTP {res.status_code}")
+                        
+        except Exception as e:
+            print(f"[Debug] 轮询期间发生网络抖动: {e}")
+            
         time.sleep(3)
+        
+    print("[-] 轮询 Smailpro 收件箱超时")
     return None
 
 
+# ============================================================
+# 正则提取器
+# ============================================================
 def extract_verification_code(content: str) -> Optional[str]:
-    """
-    从邮件内容提取验证码。
-    Grok/x.ai 格式：MM0-SF3（3位-3位字母数字混合）或 6 位纯数字。
-    """
     if not content:
         return None
-
-    # 模式 1: Grok 格式 XXX-XXX
     m = re.search(r"(?<![A-Z0-9-])([A-Z0-9]{3}-[A-Z0-9]{3})(?![A-Z0-9-])", content)
     if m:
         return m.group(1)
-
-    # 模式 2: 带标签的验证码
     m = re.search(r"(?:verification code|验证码|your code)[:\s]*[<>\s]*([A-Z0-9]{3}-[A-Z0-9]{3})\b", content, re.IGNORECASE)
     if m:
         return m.group(1)
-
-    # 模式 3: HTML 样式包裹
     m = re.search(r"background-color:\s*#F3F3F3[^>]*>[\s\S]*?([A-Z0-9]{3}-[A-Z0-9]{3})[\s\S]*?</p>", content)
     if m:
         return m.group(1)
-
-    # 模式 4: Subject 行 6 位数字
     m = re.search(r"Subject:.*?(\d{6})", content)
     if m and m.group(1) != "177010":
         return m.group(1)
-
-    # 模式 5: HTML 标签内 6 位数字
     for code in re.findall(r">\s*(\d{6})\s*<", content):
         if code != "177010":
             return code
-
-    # 模式 6: 独立 6 位数字
     for code in re.findall(r"(?<![&#\d])(\d{6})(?![&#\d])", content):
         if code != "177010":
             return code
-
     return None

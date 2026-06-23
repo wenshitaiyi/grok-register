@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+*.bk
+*-duckmail.py
 logs/
 sso/
 chrome_data/
