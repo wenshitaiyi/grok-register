@@ -97,6 +97,10 @@ python DrissionPage_example.py --count 50
 
 # 无限循环
 python DrissionPage_example.py --count 0
+
+
+# linux上无头启动（需要使用这种方式才能够运行）
+xvfb-run --server-args="-screen 0 1024x768x24" .venv/bin/python DrissionPage_example.py --count 3000
 ```
 
 无头服务器会自动启用 Xvfb，无需额外配置。
